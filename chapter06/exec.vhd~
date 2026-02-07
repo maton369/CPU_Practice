@@ -20,7 +20,7 @@
 -- - exec は CLK_EX（Execute段クロック）の立ち上がりで動作し、
 --   “この命令で次にPCをどうするか” と “書き戻し/書き込みをどうするか” を確定させる。
 -- - 出力の役割は以下。
-v--
+--
 --   P_COUNT : 次にFetch段が参照する命令番地（PC）を出す
 --   REG_IN  : レジスタ書き戻し値（WriteBack段の reg_wb へ渡すデータ）
 --   RAM_IN  : メモリ書き込みデータ（WriteBack段の ram_wb へ渡す storeデータ）
