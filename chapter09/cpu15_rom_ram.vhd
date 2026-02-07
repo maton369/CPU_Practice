@@ -1,0 +1,390 @@
+-- cpu15_rom_ram.vhd
+-- =============================================================================
+-- 【このモジュールの位置づけ（自作CPU観点）】
+-- 本ファイルは cpu15 の「トップ相当（SoCの最小構成）」であり、
+-- これまで分割して作った各ブロック（クロック段生成 / 命令ROM / デコード /
+-- レジスタファイル / 実行部 / RAM+MMIO）を“配線（インターコネクト）”して
+-- 1つのCPUとして動かすための統合ラッパである。
+--
+-- 重要なのは「各ブロックのアルゴリズムが、段（FT/DC/EX/WB）でどう連携するか」。
+-- ここでは以下の“マイクロアーキテクチャの流れ”が実体配線として表れている：
+--
+--   (1) clk_gen が 1つの外部CLKから、4段の段クロックを順に生成
+--   (2) Fetch（FT）: fetch_rom が PC(P_COUNT) を使って命令語 PROM_OUT を出す
+--   (3) Decode（DC）: decode が PROM_OUT を OP_CODE / OP_DATA に分解
+--   (4) Operand Read（DC）: reg_dc が命令に指定されたレジスタ番号から REG_A/REG_B を読み出す
+--   (5) Execute（EX）: exec が OP_CODE, REG_A, REG_B, OP_DATA, RAM_OUT を使って
+--                     次PC / 書き戻し値 / RAM書込値 / 書込イネーブルを決める
+--   (6) Write Back（WB）:
+--       - reg_wb が REG_WEN に従って REG_IN をレジスタファイルに反映
+--       - ram_dc_wb が RAM_WEN に従って RAM_IN をRAMまたはIOへ反映
+--
+-- つまり「制御（OP_CODE/OP_DATA）とデータパス（REG/RAM）の結線」を見れば、
+-- CPUの“アルゴリズム（命令実行サイクル）”がそのまま読める。
+-- =============================================================================
+
+library IEEE;
+use IEEE.std_logic_1164.all;
+use IEEE.std_logic_unsigned.all;
+
+-- =============================================================================
+-- 入出力（外部から見たCPU）
+vv-- =============================================================================
+entity cpu15_rom_ram is
+	port(
+		CLK        : in  std_logic;                         -- 外部クロック（基準クロック）
+		RESET_N    : in  std_logic;                         -- 非同期ではなく同期的に使う想定のリセット（Lowでリセット）
+		IO65_IN    : in  std_logic_vector(15 downto 0);      -- メモリマップド入力（アドレス65相当）
+		IO64_OUT   : out std_logic_vector(15 downto 0)       -- メモリマップド出力（アドレス64相当）
+	);
+end cpu15_rom_ram;
+
+architecture RTL of cpu15_rom_ram is
+
+	-- =========================================================================
+	-- 各ブロック（コンポーネント）宣言
+	-- =========================================================================
+
+	-- clk_gen:
+	-- 1つの外部CLKから、FT/DC/EX/WBの4段クロックを順番に1パルスずつ立てる。
+	-- 自作CPU観点では「段を時間分割している」ので、
+	--   - 配線の分かりやすさ
+	--   - 教材としての追跡しやすさ
+	-- を優先した構成になっている。
+	component clk_gen
+		port(
+			CLK     : in  std_logic;
+			CLK_FT  : out std_logic;
+			CLK_DC  : out std_logic;
+			CLK_EX  : out std_logic;
+			CLK_WB  : out std_logic
+		);
+	end component;
+
+	-- fetch_rom:
+	-- 命令ROM（PROM）をFPGAのメガファンクションで実装したもの。
+	-- address(PC) を与えると 命令語(q) が出てくる。
+	-- ここでは clock に CLK_FT を与えることで「Fetch段のタイミングで読む」構造にしている。
+	component fetch_rom
+		port(
+			address : in  std_logic_vector(7 downto 0);      -- PC（8bit）で命令アドレス指定
+			clock   : in  std_logic;                         -- ROM読み出しのクロック（ここではCLK_FT）
+			q       : out std_logic_vector(14 downto 0)      -- 命令語（15bit）※このCPUの命令幅
+		);
+	end component;
+
+	-- decode:
+	-- 命令語(15bit)から、実行部が使う OP_CODE(4bit) と 即値/アドレス OP_DATA(8bit) を切り出す。
+	-- 自作CPU観点では「命令フォーマットの仕様」をそのまま回路化している部分。
+	component decode
+		port(
+			CLK_DC   : in  std_logic;                        -- Decode段クロック
+			PROM_OUT : in  std_logic_vector(14 downto 0);     -- Fetchで得た命令語
+			OP_CODE  : out std_logic_vector(3 downto 0);      -- 命令の種類
+			OP_DATA  : out std_logic_vector(7 downto 0)       -- 即値/アドレス等（下位8bit）
+		);
+	end component;
+
+	-- reg_dc:
+	-- レジスタファイル（REG_0..REG_7）から、指定番号のレジスタ値を取り出す“読み出し多重化器”。
+	-- 命令語にはレジスタ番号が2つ含まれるので、同じreg_dcを2個使い REG_A/REG_B を得る。
+	component reg_dc
+		port(
+			CLK_DC   : in  std_logic;
+			N_REG_IN : in  std_logic_vector(2 downto 0);      -- どのレジスタを読むか（3bitで0..7）
+			REG_0    : in  std_logic_vector(15 downto 0);
+			REG_1    : in  std_logic_vector(15 downto 0);
+			REG_2    : in  std_logic_vector(15 downto 0);
+			REG_3    : in  std_logic_vector(15 downto 0);
+			REG_4    : in  std_logic_vector(15 downto 0);
+			REG_5    : in  std_logic_vector(15 downto 0);
+			REG_6    : in  std_logic_vector(15 downto 0);
+			REG_7    : in  std_logic_vector(15 downto 0);
+			N_REG_OUT: out std_logic_vector(2 downto 0);      -- 入力番号を次段へ“通す”（段間でレジスタ番号を保持）
+			REG_OUT  : out std_logic_vector(15 downto 0)      -- 読み出したレジスタ値
+		);
+	end component;
+
+	-- exec:
+	-- CPUの“心臓部”。
+	-- OP_CODEに応じてALU演算/シフト/即値ロード/分岐判定/Load/Store制御を行い、
+	--   - 次PC（P_COUNT）
+	--   - レジスタ書き戻し値（REG_IN）と書き込み有効（REG_WEN）
+	--   - RAM書き込み値（RAM_IN）と書き込み有効（RAM_WEN）
+	-- を生成する。
+	component exec
+		port(
+			CLK_EX   : in  std_logic;
+			RESET_N  : in  std_logic;
+			OP_CODE  : in  std_logic_vector(3 downto 0);
+			REG_A    : in  std_logic_vector(15 downto 0);
+			REG_B    : in  std_logic_vector(15 downto 0);
+			OP_DATA  : in  std_logic_vector(7 downto 0);
+			RAM_OUT  : in  std_logic_vector(15 downto 0);     -- DC段で読んだRAM/IOの値（Load用）
+			P_COUNT  : out std_logic_vector(7 downto 0);       -- PC（次Fetchで使う）
+			REG_IN   : out std_logic_vector(15 downto 0);      -- 書き戻す値
+			RAM_IN   : out std_logic_vector(15 downto 0);      -- Storeする値
+			REG_WEN  : out std_logic;                          -- レジスタ書込Enable
+			RAM_WEN  : out std_logic                           -- RAM/IO書込Enable
+		);
+	end component;
+
+	-- reg_wb:
+	-- WriteBack段でレジスタファイルを更新する。
+	-- execが生成した REG_IN を、レジスタ番号 N_REG に従って REG_0..REG_7 のどれかへ書く。
+	component reg_wb
+		port(
+			CLK_WB : in  std_logic;
+			RESET_N: in  std_logic;
+			N_REG  : in  std_logic_vector(2 downto 0);
+			REG_IN : in  std_logic_vector(15 downto 0);
+			REG_WEN: in  std_logic;
+			REG_0  : out std_logic_vector(15 downto 0);
+			REG_1  : out std_logic_vector(15 downto 0);
+			REG_2  : out std_logic_vector(15 downto 0);
+			REG_3  : out std_logic_vector(15 downto 0);
+			REG_4  : out std_logic_vector(15 downto 0);
+			REG_5  : out std_logic_vector(15 downto 0);
+			REG_6  : out std_logic_vector(15 downto 0);
+			REG_7  : out std_logic_vector(15 downto 0)
+		);
+	end component;
+
+	-- ram_dc_wb:
+	-- Dataメモリ＋MMIOを「DC段読み出し」「WB段書き込み」で統合したRAMブロック。
+	-- ここを経由することで、Load/Store命令だけで外部入出力（IO64/IO65）が実現できる。
+	component ram_dc_wb
+		port(
+			CLK_DC   : in  std_logic;
+			CLK_WB   : in  std_logic;
+			RAM_ADDR : in  std_logic_vector(7 downto 0);      -- アドレス（命令の下位8bitをそのまま使う設計）
+			RAM_IN   : in  std_logic_vector(15 downto 0);     -- Storeデータ
+			IO65_IN  : in  std_logic_vector(15 downto 0);     -- MMIO入力（addr=65）
+			RAM_WEN  : in  std_logic;                         -- Store有効
+			RAM_OUT  : out std_logic_vector(15 downto 0);     -- Loadデータ
+			IO64_OUT : out std_logic_vector(15 downto 0)      -- MMIO出力（addr=64）
+		);
+	end component;
+
+	-- =========================================================================
+	-- 内部信号（段間配線）
+	-- =========================================================================
+	signal CLK_FT       : std_logic;
+	signal CLK_DC       : std_logic;
+	signal CLK_EX       : std_logic;
+	signal CLK_WB       : std_logic;
+
+	signal P_COUNT      : std_logic_vector(7 downto 0);     -- Program Counter（8bit）
+	signal PROM_OUT     : std_logic_vector(14 downto 0);    -- 命令語（Fetch→Decode）
+
+	signal OP_CODE      : std_logic_vector(3 downto 0);     -- 命令種別（Decode→Exec）
+	signal OP_DATA      : std_logic_vector(7 downto 0);     -- 即値/アドレス（Decode→Exec）
+
+	signal N_REG_A      : std_logic_vector(2 downto 0);     -- 命令で指定されたA側レジスタ番号
+	signal N_REG_B      : std_logic_vector(2 downto 0);     -- 命令で指定されたB側レジスタ番号（※今回は主にREG_Bの読み出しに使用）
+
+	signal REG_IN       : std_logic_vector(15 downto 0);    -- Exec→WB（レジスタ書き戻し値）
+	signal REG_A        : std_logic_vector(15 downto 0);    -- DCで読んだオペランドA
+	signal REG_B        : std_logic_vector(15 downto 0);    -- DCで読んだオペランドB
+	signal REG_WEN      : std_logic;                        -- レジスタ書込Enable
+
+	-- レジスタファイル実体（reg_wbが保持する）
+	signal REG_0        : std_logic_vector(15 downto 0);
+	signal REG_1        : std_logic_vector(15 downto 0);
+	signal REG_2        : std_logic_vector(15 downto 0);
+	signal REG_3        : std_logic_vector(15 downto 0);
+	signal REG_4        : std_logic_vector(15 downto 0);
+	signal REG_5        : std_logic_vector(15 downto 0);
+	signal REG_6        : std_logic_vector(15 downto 0);
+	signal REG_7        : std_logic_vector(15 downto 0);
+
+	-- Data RAM/IO系（exec ↔ ram_dc_wb）
+	signal RAM_IN       : std_logic_vector(15 downto 0);    -- Storeデータ
+	signal RAM_OUT      : std_logic_vector(15 downto 0);    -- Loadデータ
+	signal RAM_WEN      : std_logic;                        -- Store有効
+	signal IO64_OUT_TMP : std_logic_vector(15 downto 0);    -- MMIO出力の“生”値（あとで表示用に加工する）
+
+begin
+
+	-- =========================================================================
+	-- (1) 段クロック生成：外部CLK → FT/DC/EX/WB の順に1パルス
+	-- =========================================================================
+	-- 自作CPUの教材でよくやる「マルチフェーズクロック（4相）」方式。
+	-- 同一のCLKをそのまま全ブロックに配るのではなく、段を時間的に分離して
+	-- “どの段で何が確定するか” を波形で追いやすくしている。
+	C1 : clk_gen
+		port map(
+			CLK    => CLK,
+			CLK_FT => CLK_FT,
+			CLK_DC => CLK_DC,
+			CLK_EX => CLK_EX,
+			CLK_WB => CLK_WB
+		);
+
+	-- =========================================================================
+	-- (2) Fetch段：命令ROMから命令語を読む
+	-- =========================================================================
+	-- address=PC(P_COUNT) を与えて、命令語 q(PROM_OUT) を取得する。
+	-- fetch_rom は FPGAのROM megafunction なので、一般的に同期読み出しになる。
+	-- ここでは CLK_FT で駆動して「Fetch段の立上りで命令語が更新される」形。
+	C2 : fetch_rom
+		port map(
+			address => P_COUNT,
+			clock   => CLK_FT,
+			q       => PROM_OUT
+		);
+
+	-- =========================================================================
+	-- (3) Decode段：命令語から OP_CODE / OP_DATA を抽出
+	-- =========================================================================
+	-- PROM_OUT(14..11) = OP_CODE、PROM_OUT(7..0) = OP_DATA という命令フォーマットに依存。
+	-- 自作CPUでは「命令セットの仕様（ビット割り当て）」がここで固定される。
+	C3 : decode
+		port map(
+			CLK_DC   => CLK_DC,
+			PROM_OUT => PROM_OUT,
+			OP_CODE  => OP_CODE,
+			OP_DATA  => OP_DATA
+		);
+
+	-- =========================================================================
+	-- (4) Operand Read（Decode段でのレジスタ読み出し）
+	-- =========================================================================
+	-- 命令語には2つのレジスタ番号フィールドがある：
+	--   - PROM_OUT(10..8) : レジスタA番号
+	--   - PROM_OUT(7..5)  : レジスタB番号
+	--
+	-- reg_dc は「指定番号に応じてREG_0..REG_7のどれかを出す」多重化器。
+	-- 同じモジュールを2つ並べることで、2オペランドを同時に読む構成にしている。
+
+	-- reg_dc(1): A側オペランドの読み出し
+	-- ※N_REG_OUT は次段へ番号を渡すための段間保持。ここでは exec→reg_wb へ
+	--   “書き戻し先レジスタ番号”として使われる（設計としてAフィールドが宛先）。
+	C4 : reg_dc
+		port map(
+			CLK_DC   => CLK_DC,
+			N_REG_IN => PROM_OUT(10 downto 8),
+			REG_0    => REG_0,
+			REG_1    => REG_1,
+			REG_2    => REG_2,
+			REG_3    => REG_3,
+			REG_4    => REG_4,
+			REG_5    => REG_5,
+			REG_6    => REG_6,
+			REG_7    => REG_7,
+			N_REG_OUT=> N_REG_A,
+			REG_OUT  => REG_A
+		);
+
+	-- reg_dc(2): B側オペランドの読み出し
+	C5 : reg_dc
+		port map(
+			CLK_DC   => CLK_DC,
+			N_REG_IN => PROM_OUT(7 downto 5),
+			REG_0    => REG_0,
+			REG_1    => REG_1,
+			REG_2    => REG_2,
+			REG_3    => REG_3,
+			REG_4    => REG_4,
+			REG_5    => REG_5,
+			REG_6    => REG_6,
+			REG_7    => REG_7,
+			N_REG_OUT=> N_REG_B,
+			REG_OUT  => REG_B
+		);
+
+	-- =========================================================================
+	-- (5) Execute段：ALU/分岐/Load/Store制御、次PC生成
+	-- =========================================================================
+	-- exec は段設計の中核であり、ここで「命令1本分の意味」が決まる。
+	-- 入力：
+	--   - OP_CODE / OP_DATA（デコード結果）
+	--   - REG_A / REG_B（オペランド）
+	--   - RAM_OUT（Loadで使うデータ：DC段で読まれた値）
+	-- 出力：
+	--   - P_COUNT（次にフェッチするPC）
+	--   - REG_IN/REG_WEN（レジスタ書き戻し）
+	--   - RAM_IN/RAM_WEN（Store）
+	C6 : exec
+		port map(
+			CLK_EX   => CLK_EX,
+			RESET_N  => RESET_N,
+			OP_CODE  => OP_CODE,
+			REG_A    => REG_A,
+			REG_B    => REG_B,
+			OP_DATA  => OP_DATA,
+			RAM_OUT  => RAM_OUT,
+			P_COUNT  => P_COUNT,
+			REG_IN   => REG_IN,
+			RAM_IN   => RAM_IN,
+			REG_WEN  => REG_WEN,
+			RAM_WEN  => RAM_WEN
+		);
+
+	-- =========================================================================
+	-- (6) WriteBack段：レジスタファイル更新（副作用の確定の一部）
+	-- =========================================================================
+	-- REG_WEN=1 のときだけ、REG_IN を N_REG_A で指定されたレジスタに書く。
+	-- ここが「CPU内部状態（レジスタ）の確定点」。
+	C7 : reg_wb
+		port map(
+			CLK_WB  => CLK_WB,
+			RESET_N => RESET_N,
+			N_REG   => N_REG_A,
+			REG_IN  => REG_IN,
+			REG_WEN => REG_WEN,
+			REG_0   => REG_0,
+			REG_1   => REG_1,
+			REG_2   => REG_2,
+			REG_3   => REG_3,
+			REG_4   => REG_4,
+			REG_5   => REG_5,
+			REG_6   => REG_6,
+			REG_7   => REG_7
+		);
+
+	-- =========================================================================
+	-- (7) Data RAM + MMIO：DCで読み、WBで書く（副作用の確定のもう一部）
+	-- =========================================================================
+	-- RAM_ADDR に命令語の下位8bit（PROM_OUT(7..0)）を使う設計。
+	-- これはISAとして「Load/Store/Jump等のアドレスは OP_DATA を使う」ことを意味する。
+	--
+	-- IO65_IN は addr=65 で読める（入力ポート）
+	-- IO64_OUT は addr=64 に書く（出力ポート）
+	--
+	-- IO65_IN and "0000001111111111" は入力をマスクしている。
+	--   - 上位ビットを0化して扱う（ボードのスイッチ等で使うビット範囲を制限）
+	--   - 自作CPUの“外部仕様（どのビットが意味を持つか）”をここで規定している
+	C8 : ram_dc_wb
+		port map(
+			CLK_DC   => CLK_DC,
+			CLK_WB   => CLK_WB,
+			RAM_ADDR => PROM_OUT(7 downto 0),
+			RAM_IN   => RAM_IN,
+			IO65_IN  => IO65_IN and "0000001111111111",
+			RAM_WEN  => RAM_WEN,
+			RAM_OUT  => RAM_OUT,
+			IO64_OUT => IO64_OUT_TMP
+		);
+
+	-- =========================================================================
+	-- (8) 出力の“見せ方”加工（デバッグ/表示都合のポスト処理）
+	-- =========================================================================
+	-- IO64_OUT_TMP は MMIO（addr=64）へ書かれた“生の値”。
+	-- それを外部ピンに出す際に XOR で上位6bitを反転している。
+	--
+	-- これはCPUのアルゴリズムそのものではなく、主にボード上のLED/7seg等の
+	-- “アクティブLow/配線都合”を吸収するためのラッパ処理であることが多い。
+	--
+	-- 例：
+	--   - LEDがアクティブLow（0で点灯） → 値を反転して見やすくする
+	--   - 上位側に固定的なパターンを出して、表示範囲を強調する
+	--
+	-- 自作CPU観点では、このような処理は本来「I/Oデバイス側の都合」なので、
+	-- 将来は IO64_OUT の意味（ビット割り当て）を仕様化した上で
+	--   - “デバイス側”で反転する
+	--   - もしくは “CPUのI/O層”として別モジュールに分離する
+	-- のが拡張しやすい。
+	IO64_OUT <= IO64_OUT_TMP xor "1111110000000000";
+
+end RTL;
